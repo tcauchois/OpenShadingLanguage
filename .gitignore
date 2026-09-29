@@ -18,4 +18,5 @@ build
 .cursor/
 .opencode/
 .github/copilot-instructions.md
+.cache
 /specs

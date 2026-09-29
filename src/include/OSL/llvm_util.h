@@ -65,6 +65,7 @@ enum class TargetISA {
     AVX512_noFMA,
     HOST,
     NVPTX,
+    SPIRV,
     COUNT
 };
 
@@ -272,6 +273,10 @@ public:
     /// Return a pointer to the TargetMachine for NVPTX.  Create the TargetMachine
     /// if it has not yet been created.
     llvm::TargetMachine* nvptx_target_machine();
+
+    /// Return a pointer to the TargetMachine for SPIR-V (Vulkan).  Create
+    /// the TargetMachine if it has not yet been created.
+    llvm::TargetMachine* spirv_target_machine();
 
     enum class Linkage {
         External,  // Externally visible
@@ -982,6 +987,7 @@ public:
     llvm::Value* op_int_to_bool(llvm::Value* a);
     llvm::Value* op_float_to_double(llvm::Value* a);
     llvm::Value* op_int_to_longlong(llvm::Value* a);
+    llvm::Value* op_longlong_to_int(llvm::Value* a);
 
     llvm::Value* op_and(llvm::Value* a, llvm::Value* b);
     llvm::Value* op_or(llvm::Value* a, llvm::Value* b);
@@ -1031,6 +1037,10 @@ public:
     bool ptx_compile_group(llvm::Module* lib_module, const std::string& name,
                            std::string& out);
 
+    /// Generate a SPIR-V binary for the current Module. Returns false if
+    /// SPIR-V support is not available.
+    bool spirv_compile_group(std::vector<uint32_t>& out);
+
     /// Convert all functions in module's bitcode to a string.
     std::string bitcode_string(llvm::Module* module);
 
@@ -1076,6 +1086,7 @@ private:
     llvm::ExecutionEngine* m_llvm_exec;
     TargetISA m_target_isa = TargetISA::UNKNOWN;
     llvm::TargetMachine* m_nvptx_target_machine;
+    llvm::TargetMachine* m_spirv_target_machine = nullptr;
 
     std::vector<llvm::BasicBlock*> m_return_block;      // stack for func call
     std::vector<llvm::BasicBlock*> m_loop_after_block;  // stack for break

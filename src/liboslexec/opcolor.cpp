@@ -244,6 +244,11 @@ ColorSystem::ocio_transform(ustringhash fromspace, ustringhash tospace,
         OSL::errorfmt(ec, "Unknown color space transformation \"{}\" -> \"{}\"",
                       fromspace, tospace);
     }
+#elif defined(OSL_SPIRV_SHADEOPS)
+    // No OCIO on the GPU, so any other space is unknown. (The context is
+    // always valid here, and comparing it with null crashes LLVM 22.)
+    OSL::errorfmt(ec, "Unknown color space transformation \"{}\" -> \"{}\"",
+                  fromspace, tospace);
 #endif  // !define(__CUDA_ARCH__) && !defined(OSL_COMPILING_TO_BITCODE)
 
     return C;
@@ -425,9 +430,18 @@ namespace {
 inline const ColorSystem&
 get_colorsystem(OSL::OpaqueExecContextPtr oec)
 {
-    auto ec                  = pvt::get_ec(oec);
-    ShadingStateUniform* ssu = (ShadingStateUniform*)ec->shadingStateUniform;
-    return ssu->m_colorsystem;
+    return get_shading_state_uniform(oec).m_colorsystem;
+}
+
+// The ShadingContext, used only for host-only OCIO color transforms.
+inline ShadingContext*
+shading_context(ExecContextPtr ec)
+{
+#ifdef OSL_SPIRV_SHADEOPS
+    return nullptr;
+#else
+    return ec->context;
+#endif
 }
 
 }  // namespace
@@ -484,7 +498,7 @@ osl_prepend_color_from(OpaqueExecContextPtr oec, void* c_,
     auto from             = ustringhash_from(from_);
     const ColorSystem& cs = get_colorsystem(oec);
     auto ec               = pvt::get_ec(oec);
-    COL(c_)               = cs.to_rgb(from, COL(c_), ec->context, ec);
+    COL(c_)               = cs.to_rgb(from, COL(c_), shading_context(ec), ec);
 }
 
 
@@ -502,7 +516,7 @@ osl_transformc(OpaqueExecContextPtr oec, void* Cin, int Cin_derivs, void* Cout,
 
     if (Cout_derivs) {
         if (Cin_derivs) {
-            DCOL(Cout) = cs.transformc(from, to, DCOL(Cin), ec->context, ec);
+            DCOL(Cout) = cs.transformc(from, to, DCOL(Cin), shading_context(ec), ec);
             return true;
         } else {
             // We had output derivs, but not input. Zero the output
@@ -513,7 +527,7 @@ osl_transformc(OpaqueExecContextPtr oec, void* Cin, int Cin_derivs, void* Cout,
     }
 
     // No-derivs case
-    COL(Cout) = cs.transformc(from, to, COL(Cin), ec->context, ec);
+    COL(Cout) = cs.transformc(from, to, COL(Cin), shading_context(ec), ec);
     return true;
 }
 

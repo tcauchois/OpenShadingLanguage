@@ -28,6 +28,7 @@ BackendLLVM::BackendLLVM(ShadingSystemImpl& shadingsys, ShaderGroup& group,
     , m_stat_llvm_jit_time(0)
 {
     m_use_optix      = shadingsys.use_optix();
+    m_use_spirv      = shadingsys.use_spirv();
     m_use_rs_bitcode = !shadingsys.m_rs_bitcode.empty();
     m_name_llvm_syms = shadingsys.m_llvm_output_bitcode;
 
@@ -74,7 +75,7 @@ llvm::Type*
 BackendLLVM::llvm_pass_type(const TypeSpec& typespec)
 {
     if (typespec.is_closure_based())
-        return (llvm::Type*)ll.type_void_ptr();
+        return use_spirv() ? ll.type_int64() : (llvm::Type*)ll.type_void_ptr();
     TypeDesc t     = typespec.simpletype().elementtype();
     llvm::Type* lt = NULL;
     if (t == TypeDesc::FLOAT)
@@ -195,6 +196,16 @@ static ustring fields[] = { ustring("P"),
                             ustring("backfacing") };
 }  // namespace
 
+ustring
+BackendLLVM::ShaderGlobalIndexToName(int index)
+{
+    return index >= 0 && index < int(sizeof(fields) / sizeof(fields[0]))
+               ? fields[index]
+               : ustring();
+}
+
+
+
 int
 BackendLLVM::ShaderGlobalNameToIndex(ustring name)
 {
@@ -239,6 +250,9 @@ BackendLLVM::getLLVMSymbolBase(const Symbol& sym)
         // Generate the pointer to this symbol by offsetting into the
         // interactive data block.
         int offset = group().interactive_param_offset(layer(), sym.name());
+        if (use_spirv())  // SPIR-V can't do pointer arithmetic via ints
+            return ll.GEP(ll.type_int8(), m_llvm_interactive_params_ptr,
+                          offset);
         return ll.offset_ptr(m_llvm_interactive_params_ptr, offset,
                              llvm_ptr_type(sym.typespec().elementtype()));
     }
@@ -759,8 +773,7 @@ BackendLLVM::llvm_assign_impl(Symbol& Result, Symbol& Src, int arrayindex,
             llvm::Value* srcval = llvm_load_value(Src, 0, arrind, 0);
             llvm_store_value(srcval, Result, 0, arrind, 0);
         } else {
-            llvm::Value* null = ll.constant_ptr(NULL, ll.type_void_ptr());
-            llvm_store_value(null, Result, 0, arrind, 0);
+            llvm_store_value(llvm_null_closure(), Result, 0, arrind, 0);
         }
         return true;
     }

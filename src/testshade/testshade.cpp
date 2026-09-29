@@ -39,6 +39,9 @@
 
 #include "render_state.h"
 #include "simplerend.h"
+#if OSL_USE_VULKAN
+#    include "vulkangridrender.h"
+#endif
 
 
 extern int testshade_llvm_compiled_rs_size;
@@ -89,6 +92,8 @@ static bool print_outputs        = false;
 static bool output_placement     = true;
 static bool use_optix            = OIIO::Strutil::stoi(
     OIIO::Sysutil::getenv("TESTSHADE_OPTIX"));
+static bool use_vulkan           = OIIO::Strutil::stoi(
+    OIIO::Sysutil::getenv("TESTSHADE_VULKAN"));
 static bool optix_no_inline             = false;
 static bool optix_no_inline_layer_funcs = false;
 static bool optix_no_merge_layer_funcs  = false;
@@ -347,8 +352,8 @@ set_shadingsys_options()
     if (texoptions.size())
         shadingsys->texturesys()->attribute("options", texoptions);
 
-    if (use_optix) {
-        // FIXME: For now, output placement is disabled for OptiX mode
+    if (use_optix || use_vulkan) {
+        // FIXME: For now, output placement is disabled for GPU modes
         output_placement = false;
     }
 
@@ -676,6 +681,11 @@ print_info()
         rend.reset(new OptixGridRenderer);
     else
 #endif
+#if OSL_USE_VULKAN
+        if (use_vulkan)
+        rend.reset(new VulkanGridRenderer);
+    else
+#endif
         rend.reset(new SimpleRenderer);
     auto texturesys = TextureSystem::create();
 #if OIIO_TEXTURESYSTEM_CREATE_SHARED
@@ -719,6 +729,8 @@ getargs(int argc, const char* argv[])
       .help("Set thread count (default = 0: auto-detect #cores)");
     ap.arg("--optix", &use_optix)
       .help("Use OptiX if available");
+    ap.arg("--vulkan", &use_vulkan)
+      .help("Use Vulkan (SPIR-V) if available");
     ap.arg("--debug", &debug1)
       .help("Lots of debugging info");
     ap.arg("--debug2", &debug2)
@@ -1955,6 +1967,11 @@ test_shade(int argc, const char* argv[])
         rend.reset(new OptixGridRenderer);
     else
 #endif
+#if OSL_USE_VULKAN
+        if (use_vulkan)
+        rend.reset(new VulkanGridRenderer);
+    else
+#endif
         rend.reset(new SimpleRenderer);
 
     // Other renderer and global options
@@ -2152,6 +2169,25 @@ test_shade(int argc, const char* argv[])
 
     synchio();
 
+#if OSL_USE_VULKAN
+    if (use_vulkan) {
+        VulkanGridRenderer::GridParams grid;
+        grid.pixelcenters = pixelcenters;
+        grid.vary_Pdxdy   = vary_Pdxdy;
+        grid.vary_udxdy   = vary_udxdy;
+        grid.vary_vdxdy   = vary_vdxdy;
+        grid.uscale       = uscale;
+        grid.vscale       = vscale;
+        grid.uoffset      = uoffset;
+        grid.voffset      = voffset;
+        grid.raytype_bit = shadingsys->raytype_bit(ustring(raytype_name));
+        grid.shader2common = Mshad;
+        grid.object2common = Mobj;
+        grid.print_outputs = print_outputs;
+        grid.output_names  = outputvarnames;
+        static_cast<VulkanGridRenderer*>(rend.get())->set_grid_params(grid);
+    }
+#endif
     rend->prepare_render();
     if (use_rs_bitcode) {
         // SimpleRend to supply the required state for render service free functions
@@ -2192,7 +2228,7 @@ test_shade(int argc, const char* argv[])
     for (int iter = 0; iter < iters; ++iter) {
         OIIO::ROI roi(0, xres, 0, yres);
 
-        if (use_optix) {
+        if (use_optix || use_vulkan) {
             rend->render(xres, yres);
         } else if (use_shade_image) {
             // TODO: do we need a batched option/version of shade_image?
@@ -2265,6 +2301,11 @@ test_shade(int argc, const char* argv[])
     journal::TrackRecentlyReported tracker_error_warnings(
         limit_errors, error_history_capacity, limit_warnings,
         warning_history_capacity);
+#if OSL_USE_VULKAN
+    if (use_vulkan)
+        static_cast<VulkanGridRenderer*>(rend.get())->journal_messages(
+            jbuffer.get());
+#endif
     TestshadeReporter reporter(&rend->errhandler(), tracker_error_warnings);
     OSL::journal::Reader jreader(jbuffer.get(), reporter);
     jreader.process();

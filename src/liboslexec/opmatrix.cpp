@@ -29,6 +29,18 @@
 OSL_NAMESPACE_BEGIN
 namespace pvt {
 
+// The matrix inverse used by the shadeops. For SPIR-V, use a version
+// without runtime row indexing (see fixedIndexInverse).
+static OSL_FORCEINLINE OSL_HOSTDEVICE Matrix44
+matrix_inverse(const Matrix44& m)
+{
+#ifdef OSL_SPIRV_SHADEOPS
+    return fixedIndexInverse(m);
+#else
+    return m.inverse();
+#endif
+}
+
 
 
 // Matrix ops
@@ -49,7 +61,7 @@ osl_mul_mmf(void* r, void* a, float b)
 OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_mmm(void* r, void* a, void* b)
 {
-    MAT(r) = MAT(a) * MAT(b).inverse();
+    MAT(r) = MAT(a) * matrix_inverse(MAT(b));
 }
 
 OSL_SHADEOP OSL_HOSTDEVICE void
@@ -61,7 +73,7 @@ osl_div_mmf(void* r, void* a, float b)
 OSL_SHADEOP OSL_HOSTDEVICE void
 osl_div_mfm(void* r, float a, void* b)
 {
-    MAT(r) = a * MAT(b).inverse();
+    MAT(r) = a * matrix_inverse(MAT(b));
 }
 
 OSL_SHADEOP OSL_HOSTDEVICE void
@@ -124,7 +136,7 @@ osl_transformn_vmv(void* result, void* M_, void* v_)
     const Vec3& v     = VEC(v_);
     const Matrix44& M = MAT(M_);
     //M.inverse().transposed().multDirMatrix (v, VEC(result));
-    multDirMatrix(inlinedTransposed(M.inverse()), v, VEC(result));
+    multDirMatrix(inlinedTransposed(matrix_inverse(M)), v, VEC(result));
 }
 
 OSL_SHADEOP OSL_HOSTDEVICE void
@@ -133,7 +145,7 @@ osl_transformn_dvmdv(void* result, void* M_, void* v_)
     const Dual2<Vec3>& v = DVEC(v_);
     const Matrix44& M    = MAT(M_);
     //multDirMatrix (M.inverse().transposed(), v, DVEC(result));
-    multDirMatrix(inlinedTransposed(M.inverse()), v, DVEC(result));
+    multDirMatrix(inlinedTransposed(matrix_inverse(M)), v, DVEC(result));
 }
 
 #ifndef __CUDACC__

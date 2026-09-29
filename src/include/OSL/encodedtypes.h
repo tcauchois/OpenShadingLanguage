@@ -211,6 +211,37 @@ template<> struct TypeEncoder<uint8_t> {
                   "unexpected");
     static DataType Encode(const uint8_t val) { return DataType(val); }
 };
+/// Hash of a format specification for the *fmt functions. Normally this
+/// makes a ustring (so the host can find the text again from the hash).
+/// Shadeops compiled for SPIR-V can't create ustrings, so there it just
+/// hashes the text; the shading system registers those string literals
+/// with the host ustring table instead.
+template<typename SpecifierT>
+inline OSL::ustringhash
+fmt_specification_hash(const SpecifierT& fmt_specification)
+{
+    return OSL::ustringhash { fmt_specification };
+}
+
+#ifdef OSL_SPIRV_SHADEOPS
+// Marks a string literal that the host must know (to decode messages that
+// refer to it by hash). The shading system interns the argument of each
+// call when it loads the shadeops, then removes the calls.
+extern "C" void
+osl_spirv_intern_string(const char* s);
+
+// String literals: hash them at compile time.
+template<size_t N>
+inline OSL::ustringhash
+fmt_specification_hash(const char (&fmt_specification)[N])
+{
+    osl_spirv_intern_string(fmt_specification);
+    // (The empty string's hash is 0, as for ustrings.)
+    return OSL::ustringhash(
+        N > 1 ? OIIO::Strutil::strhash(N - 1, fmt_specification) : 0);
+}
+#endif
+
 }  // namespace pvt
 
 

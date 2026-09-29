@@ -128,6 +128,10 @@ set (lib_src
           rs_fallback.cpp
           journal.cpp
     )
+if (OSL_USE_VULKAN)
+    # LLVM passes that prepare shader groups for the SPIR-V backend
+    list (APPEND lib_src spirv_passes.cpp llvm_spirv.cpp spirv_slang_abi.cpp)
+endif ()
 if (OSL_BUILD_BATCHED)
     list(APPEND lib_src 
           batched_analysis.cpp
@@ -201,6 +205,26 @@ if (USE_LLVM_BITCODE)
     list (APPEND rs_dependent_ops_srcs ${llvm_ops_srcs})
 
     EMBED_LLVM_BITCODE_IN_CPP ( "${rs_dependent_ops_srcs}" "_host_rs" "osl_llvm_compiled_rs_dependent_ops" lib_src "" "${include_dirs}")
+
+    if (OSL_USE_VULKAN)
+        # Shadeops for SPIR-V. These are compiled for the host (so that the
+        # host headers work) with SIMD disabled, and retargeted to SPIR-V
+        # when each shader group is compiled.
+        set (spirv_shadeops_srcs
+            llvm_ops.cpp opnoise.cpp opspline.cpp opcolor.cpp opmatrix.cpp
+            opfmt.cpp optexture.cpp rs_spirv.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslnoise/simplexnoise.cpp
+            ${CMAKE_SOURCE_DIR}/src/liboslnoise/gabornoise.cpp
+        )
+        # EMBED_LLVM_BITCODE_IN_CPP picks up dependencies on the headers in
+        # ${exec_headers}; also depend on liboslnoise's private headers.
+        file (GLOB _oslnoise_headers "${CMAKE_SOURCE_DIR}/src/liboslnoise/*.h")
+        list (APPEND exec_headers ${_oslnoise_headers})
+        EMBED_LLVM_BITCODE_IN_CPP ( "${spirv_shadeops_srcs}" "_spirv"
+            "osl_llvm_compiled_spirv_ops" lib_src
+            "-DOSL_SPIRV_SHADEOPS=1;-DNDEBUG;-DOIIO_NO_SIMD=1;-fno-vectorize;-fno-slp-vectorize;-ffast-math;-fno-finite-math-only;-fno-exceptions"
+            "${include_dirs}")
+    endif ()
 
     if (CUDA_FOUND)
         add_compile_definitions (OSL_LLVM_CUDA_BITCODE)
@@ -627,4 +651,18 @@ if (OSL_BUILD_TESTS AND BUILD_TESTING)
     target_include_directories (llvmutil_test  BEFORE PRIVATE ${OpenImageIO_INCLUDES})
     set_target_properties (llvmutil_test PROPERTIES FOLDER "Unit Tests")
     add_test (unit_llvmutil ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/llvmutil_test)
+
+    if (OSL_USE_VULKAN)
+        # (The passes are internal to liboslexec, so build them in.)
+        add_executable (spirv_passes_test spirv_passes_test.cpp spirv_passes.cpp)
+        target_link_libraries (spirv_passes_test PRIVATE
+            OpenImageIO::OpenImageIO_Util Imath::Imath
+            ${LLVM_LIBRARIES} ${LLVM_LDFLAGS} ${LLVM_SYSTEM_LIBRARIES}
+            ${CMAKE_DL_LIBS})
+        target_include_directories (spirv_passes_test BEFORE PRIVATE
+                                    ${OpenImageIO_INCLUDES})
+        set_target_properties (spirv_passes_test PROPERTIES FOLDER "Unit Tests")
+        add_test (unit_spirvpasses
+                  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/spirv_passes_test)
+    endif ()
 endif ()

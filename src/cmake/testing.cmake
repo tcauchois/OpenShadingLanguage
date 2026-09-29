@@ -111,6 +111,7 @@ macro ( TESTSUITE )
         set (_ats_LABEL "broken")
     endif ()
     set (test_all_optix $ENV{TESTSUITE_OPTIX})
+    set (test_all_vulkan $ENV{TESTSUITE_VULKAN})
     set (test_all_batched $ENV{TESTSUITE_BATCHED})
     set (test_all_rs_bitcode $ENV{TESTSUITE_RS_BITCODE})
     # Add the tests if all is well.
@@ -195,6 +196,22 @@ macro ( TESTSUITE )
               add_one_testsuite ("${_testname}.optix.fused" "${_testsrcdir}"
                                  ENV TESTSHADE_OPT=2 TESTSHADE_OPTIX=1 TESTSHADE_FUSED=1 )
             endif()
+        endif ()
+
+        # When building for Vulkan support, also run it in Vulkan mode if
+        # there is a VULKAN marker file in the directory, or for all tests
+        # if $TESTSUITE_VULKAN is nonzero.
+        if (OSL_USE_VULKAN
+            AND (EXISTS "${_testsrcdir}/VULKAN" OR test_all_vulkan)
+            AND NOT EXISTS "${_testsrcdir}/NOVULKAN"
+            AND NOT EXISTS "${_testsrcdir}/BATCHED_REGRESSION")
+            add_one_testsuite ("${_testname}.vulkan" "${_testsrcdir}"
+                               ENV TESTSHADE_OPT=2 TESTSHADE_VULKAN=1 )
+            set_tests_properties ("${_testname}.vulkan" PROPERTIES LABELS vulkan)
+            if (DEFINED ENV{OSL_TESTSUITE_VULKAN_THRESH_SCALE})
+                set_property (TEST "${_testname}.vulkan" APPEND PROPERTY ENVIRONMENT
+                              OSL_TESTSUITE_THRESH_SCALE=$ENV{OSL_TESTSUITE_VULKAN_THRESH_SCALE})
+            endif ()
         endif ()
 
         if (OSL_BUILD_BATCHED)

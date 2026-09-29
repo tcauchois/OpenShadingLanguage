@@ -175,7 +175,7 @@ filter_gabor_kernel_2d(const Matrix22& filter, const Dual2<float>& w, float a,
     Matrix22 Sigma_GF_Gi = Sigma_GF * Sigma_G_i;
     Vec2 mu_GF           = gabor_mul_m22_v2(Sigma_GF_Gi, mu_G);
     w_f                  = c_GF;
-    a_f                  = sqrtf(M_TWO_PI * sqrtf(determinant(Sigma_GF)));
+    a_f = sqrtf(float(M_TWO_PI) * sqrtf(determinant(Sigma_GF)));
     omega_f              = mu_GF;
     phi_f                = phi;
 }

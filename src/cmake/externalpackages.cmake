@@ -188,6 +188,30 @@ else ()
 endif ()
 
 
+# Vulkan / SPIR-V setup
+if (OSL_USE_VULKAN)
+    if (NOT USE_LLVM_BITCODE)
+        message (FATAL_ERROR "Vulkan support requires USE_LLVM_BITCODE=1")
+    endif ()
+    if (NOT LLVM_TARGETS MATCHES "(^| )SPIRV( |$)")
+        message (FATAL_ERROR "Vulkan support requires an LLVM built with the SPIRV target (have: ${LLVM_TARGETS})")
+    endif ()
+    # The Vulkan SDK's CMake packages are found via VULKAN_SDK
+    if (DEFINED ENV{VULKAN_SDK})
+        list (APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+    endif ()
+    checked_find_package (Vulkan REQUIRED)
+    checked_find_package (SPIRV-Headers REQUIRED)
+    checked_find_package (SPIRV-Tools REQUIRED)
+    checked_find_package (SPIRV-Tools-opt REQUIRED)
+    checked_find_package (SPIRV-Tools-link REQUIRED)
+    checked_find_package (slang REQUIRED)
+    find_program (SLANGC_EXECUTABLE slangc HINTS "$ENV{VULKAN_SDK}/bin")
+    find_program (SPIRV_VAL_EXECUTABLE spirv-val HINTS "$ENV{VULKAN_SDK}/bin")
+    message (STATUS "slangc: ${SLANGC_EXECUTABLE}")
+endif ()
+
+
 ###########################################################################
 # Tessil/robin-map
 

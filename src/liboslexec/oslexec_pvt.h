@@ -505,11 +505,19 @@ public:
     const ClosureEntry* get_entry(ustring name) const;
     const ClosureEntry* get_entry(int id) const
     {
-        OSL_DASSERT((size_t)id < m_closure_table.size());
+        if (id < 0 || (size_t)id >= m_closure_table.size())
+            return nullptr;
         return &m_closure_table[id];
     }
 
     bool empty() const { return m_closure_table.empty(); }
+
+    /// All the registered closures, indexed by id. (Unused ids have
+    /// entries with empty names.)
+    const std::vector<ClosureEntry>& entries() const
+    {
+        return m_closure_table;
+    }
 
 private:
     // A mapping from name to ID for the compiler
@@ -639,6 +647,13 @@ public:
 
     bool use_optix() const { return m_use_optix; }
     bool use_optix_cache() const { return m_use_optix_cache; }
+    bool use_spirv() const { return m_use_spirv; }
+    const std::vector<ustring>& renderer_outputs() const
+    {
+        return m_renderer_outputs;
+    }
+    /// Compiling for a GPU (no JIT, no host pointers in generated code)?
+    bool use_gpu() const { return m_use_optix || m_use_spirv; }
     bool debug_nan() const { return m_debugnan; }
     bool debug_uninit() const { return m_debug_uninit; }
     bool lockgeom_default() const { return m_lockgeom_default; }
@@ -729,6 +744,13 @@ public:
     {
         return m_closure_registry.get_entry(id);
     }
+    const ClosureRegistry& closure_registry() const
+    {
+        return m_closure_registry;
+    }
+    /// Size of the closure pool for SPIR-V groups that build closures in
+    /// loops (so that their size isn't known when compiled), in words.
+    int spirv_closure_pool_words() const { return m_spirv_closure_pool_words; }
 
     /// Attributes to control optimization for OptiX/CUDA
     bool optix_no_inline() const { return m_optix_no_inline; }
@@ -785,6 +807,10 @@ public:
     void count_noise(int number = 1) { m_stat_noise_calls += number; }
 
     ColorSystem& colorsystem() { return m_shading_state_uniform.m_colorsystem; }
+    const ShadingStateUniform& shading_state_uniform() const
+    {
+        return m_shading_state_uniform;
+    }
 
     std::shared_ptr<OIIO::ColorConfig> colorconfig();
 
@@ -901,6 +927,7 @@ private:
     bool m_debugnan;              ///< Root out NaN's?
     bool m_debug_uninit;          ///< Find use of uninitialized vars?
     bool m_lockgeom_default;      ///< Default value of lockgeom
+    int m_spirv_closure_pool_words = 256;  ///< see spirv_closure_pool_words()
     bool m_strict_messages;       ///< Strict checking of message passing usage?
     bool m_error_repeats;         ///< Allow repeats of identical err/warn?
     bool m_range_checking;        ///< Range check arrays & components?
@@ -966,6 +993,7 @@ private:
     int m_compile_report;    ///< Print compilation report?
     bool m_use_optix;        ///< This is an OptiX-based renderer
     bool m_use_optix_cache;  ///< Renderer-enabled caching for OptiX ptx
+    bool m_use_spirv;        ///< This is a Vulkan/SPIR-V based renderer
     int m_max_optix_groupdata_alloc;  ///< Maximum OptiX groupdata buffer allocation
     bool m_buffer_printf;             ///< Buffer/batch printf output?
     bool m_no_noise;                  ///< Substitute trivial noise calls
@@ -1975,6 +2003,7 @@ public:
     void setup_interactive_arena(cspan<uint8_t> paramblock);
 
     uint8_t* interactive_arena_ptr() { return m_interactive_arena.get(); }
+    size_t interactive_arena_size() const { return m_interactive_arena_size; }
 
     device_ptr<uint8_t>& device_interactive_arena()
     {
@@ -2030,6 +2059,7 @@ private:
         = 0;                     ///< Heap size needed for its wide groupdata
     int m_id;                    ///< Unique ID for the group
     int m_num_entry_layers = 0;  ///< Number of marked entry layers
+    std::vector<int> m_entry_layer_order;  ///< Entry layers, in marked order
     RunLLVMGroupFunc m_llvm_compiled_version = nullptr;
     RunLLVMGroupFunc m_llvm_compiled_init    = nullptr;
     std::vector<RunLLVMGroupFunc> m_llvm_compiled_layers;
@@ -2077,6 +2107,15 @@ private:
 
     // PTX assembly for compiled ShaderGroup
     std::string m_llvm_ptx_compiled_version;
+
+    // SPIR-V binary for compiled ShaderGroup
+    std::vector<uint32_t> m_llvm_spirv_compiled_version;
+    // Slang declarations for calling the SPIR-V entry point
+    std::string m_spirv_slang_abi;
+    // Groupdata field (in the Slang ABI) of each renderer output, in the
+    // order of the group's (or if none, the shading system's) renderer
+    // outputs; empty if the output isn't in groupdata.
+    std::vector<std::string> m_spirv_output_fields;
 
     ParamValueList m_pending_params;          // Pending Parameter() values
     std::vector<ParamHints> m_pending_hints;  // ParamHints of pending params

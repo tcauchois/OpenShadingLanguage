@@ -11,3 +11,7 @@ command += oiiotool("-pattern fill:topleft=0.125,0.25,0.5,0:topright=0.125,0.25,
 
 command += testshade("-g 64 64 --center -od uint8 -o Cout out.tif test")
 outputs = [ "out.txt", "out.tif" ]
+
+# Vulkan: The GPU's filtering differs slightly from OIIO's.
+if os.environ.get("TESTSHADE_VULKAN") :
+    failthresh = 0.008

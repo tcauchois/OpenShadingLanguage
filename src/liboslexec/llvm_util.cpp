@@ -3,8 +3,13 @@
 // https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
 
+#include <dlfcn.h>
+
+#include <OpenImageIO/filesystem.h>
+#include <OpenImageIO/sysutil.h>
 #include <cinttypes>
 #include <memory>
+#include <mutex>
 
 #include <OpenImageIO/fmath.h>
 #include <OpenImageIO/thread.h>
@@ -36,14 +41,17 @@ OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wmaybe-uninitialized")
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/IR/ValueSymbolTable.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/CrashRecoveryContext.h>
 #include <llvm/Support/ErrorOr.h>
 #include <llvm/Support/FileSystem.h>
 #if OSL_LLVM_VERSION < 160
@@ -59,6 +67,7 @@ OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wmaybe-uninitialized")
 #include <llvm/Analysis/TypeBasedAliasAnalysis.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/MCJIT.h>
@@ -78,6 +87,11 @@ OSL_GCC_PRAGMA(GCC diagnostic ignored "-Wmaybe-uninitialized")
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/Scalar/StructurizeCFG.h>
+#include <llvm/Transforms/Utils/FixIrreducible.h>
+#include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/LowerSwitch.h>
+#include <llvm/Transforms/Utils/UnifyLoopExits.h>
 #include <llvm/Transforms/Utils/UnifyFunctionExitNodes.h>
 
 #include <llvm/Support/DynamicLibrary.h>
@@ -603,6 +617,7 @@ LLVM_Util::~LLVM_Util()
     delete m_builder;
     delete m_llvm_debug_builder;
     delete m_nvptx_target_machine;
+    delete m_spirv_target_machine;
     module(NULL);
     // DO NOT delete m_llvm_jitmm;  // just the dummy wrapper around the real MM
 }
@@ -1196,7 +1211,10 @@ initCpuFeatures()
 // for any of the wide libraries, please update here to match
 static const char* target_isa_names[]
     = { "UNKNOWN", "none",       "x64",    "SSE4.2",       "AVX",
-        "AVX2",    "AVX2_noFMA", "AVX512", "AVX512_noFMA", "host" };
+        "AVX2",    "AVX2_noFMA", "AVX512", "AVX512_noFMA", "host",
+        "NVPTX",   "SPIRV" };
+static_assert(std::size(target_isa_names) == size_t(TargetISA::COUNT),
+              "target_isa_names must match TargetISA");
 
 
 // clang: default
@@ -1864,6 +1882,60 @@ LLVM_Util::nvptx_target_machine()
                    && "Unable to create TargetMachine for NVPTX");
     }
     return m_nvptx_target_machine;
+}
+
+
+
+llvm::TargetMachine*
+LLVM_Util::spirv_target_machine()
+{
+    if (m_spirv_target_machine == nullptr) {
+        // Work around a crash in LLVM 22's SPIR-V pre-legalizer combiner,
+        // whose select-to-FaceForward rule (rule 1) dereferences a null
+        // pointer on some selects (e.g., in gabor noise).
+        static std::once_flag spirv_options_once;
+        std::call_once(spirv_options_once, [] {
+            auto& opts = llvm::cl::getRegisteredOptions();
+            auto it    = opts.find(
+                "spirvprelegalizercombiner-disable-rule");
+            if (it != opts.end())
+                it->second->addOccurrence(0, it->first, "1");
+        });
+        llvm::Triple ModuleTriple(module()->getTargetTriple());
+        // Unlike for NVPTX, don't assume no infinities or NaNs: shadeops
+        // like safe_div rely on checking for them.
+        llvm::TargetOptions options;
+        options.AllowFPOpFusion = llvm::FPOpFusion::Fast;
+
+        std::string error;
+#if OSL_LLVM_VERSION >= 220
+        const llvm::Target* llvm_target
+            = llvm::TargetRegistry::lookupTarget(ModuleTriple, error);
+#else
+        const llvm::Target* llvm_target
+            = llvm::TargetRegistry::lookupTarget(ModuleTriple.str(), error);
+#endif
+        OSL_ASSERT(llvm_target
+                   && "SPIR-V compile error: LLVM Target is not initialized");
+
+        m_spirv_target_machine = llvm_target->createTargetMachine(
+#if OSL_LLVM_VERSION >= 210
+            llvm::Triple(ModuleTriple.str()),
+#else
+            ModuleTriple.str(),
+#endif
+            "", "", options, llvm::Reloc::Static, llvm::CodeModel::Small,
+#if OSL_LLVM_VERSION >= 180
+            llvm::CodeGenOptLevel::Default
+#else
+            llvm::CodeGenOpt::Default
+#endif
+        );
+
+        OSL_ASSERT(m_spirv_target_machine
+                   && "Unable to create TargetMachine for SPIR-V");
+    }
+    return m_spirv_target_machine;
 }
 
 
@@ -3936,7 +4008,9 @@ LLVM_Util::llvm_type(const TypeDesc& typedesc)
     else if (t == TypeDesc::UINT64 || t == TypeDesc::INT64)
         lt = type_longlong();
     else if (t == TypeDesc::PTR)
-        lt = type_void_ptr();
+        // For SPIR-V, the only pointers in OSL values (closures) are
+        // 64-bit handles instead.
+        lt = m_target_isa == TargetISA::SPIRV ? type_int64() : type_void_ptr();
     else {
         OSL_ASSERT_MSG(0, "not handling type %s yet", typedesc.c_str());
     }
@@ -6075,6 +6149,15 @@ LLVM_Util::op_int_to_longlong(llvm::Value* a)
 }
 
 
+
+llvm::Value*
+LLVM_Util::op_longlong_to_int(llvm::Value* a)
+{
+    OSL_DASSERT(a->getType() == llvm::Type::getInt64Ty(context()));
+    return builder().CreateTrunc(a, type_int());
+}
+
+
 llvm::Value*
 LLVM_Util::op_int_to_float(llvm::Value* a)
 {
@@ -6457,6 +6540,118 @@ LLVM_Util::ptx_compile_group(llvm::Module*, const std::string& name,
     }
     out = ptx_stream.str();
 
+    return true;
+#else
+    return false;
+#endif
+}
+
+
+
+// Where's oslspvemit? (Or "" to emit SPIR-V in this process.) The
+// OSL_SPIRV_EMITTER environment variable can name it (or be "none"); else
+// look next to this library, then next to the program, then in the PATH.
+static std::string
+spirv_emitter_path()
+{
+    static std::string path = [] {
+        std::string env = OIIO::Sysutil::getenv("OSL_SPIRV_EMITTER");
+        if (env == "none")
+            return std::string();
+        if (env.size())
+            return env;
+        std::vector<std::string> dirs;
+        Dl_info info;
+        if (dladdr((const void*)&spirv_emitter_path, &info) && info.dli_fname)
+            dirs.push_back(OIIO::Filesystem::parent_path(info.dli_fname));
+        std::string prog = OIIO::Filesystem::parent_path(
+            OIIO::Sysutil::this_program_path());
+        dirs.push_back(prog);
+        // (From lib/, the tools are in ../bin.)
+        for (size_t i = 0, n = dirs.size(); i < n; ++i)
+            dirs.push_back(dirs[i] + "/../bin");
+        for (auto&& d : dirs) {
+            std::string p = d + "/oslspvemit";
+            if (OIIO::Filesystem::is_executable(p))
+                return p;
+        }
+        std::string found = OIIO::Filesystem::searchpath_find(
+            "oslspvemit", OIIO::Filesystem::searchpath_split(
+                              OIIO::Sysutil::getenv("PATH")));
+        return found;
+    }();
+    return path;
+}
+
+
+
+bool
+LLVM_Util::spirv_compile_group(std::vector<uint32_t>& out)
+{
+#if OSL_USE_VULKAN
+    // (A new target machine for each group: the SPIR-V backend keeps
+    // per-module state in it -- e.g., its global registry of types and
+    // ids -- which leaks into the next module's ids if it's reused.)
+    delete m_spirv_target_machine;
+    m_spirv_target_machine = nullptr;
+    llvm::TargetMachine* target_machine = spirv_target_machine();
+
+    // LLVM 22's SPIR-V backend keeps state between the modules compiled in
+    // a process, and after a few it emits invalid SPIR-V ("Id N is defined
+    // more than once"). So emit in a separate process, with oslspvemit,
+    // when it's available. (See TOOLCHAIN_ISSUES.md.)
+    std::string emitter = spirv_emitter_path();
+    if (emitter.size()) {
+        std::string base = OIIO::Filesystem::unique_path(
+            OIIO::Filesystem::temp_directory_path() + "/osl-spirv-%%%%%%%%");
+        std::string bc = base + ".bc", spv = base + ".spv";
+        {
+            std::error_code ec;
+            llvm::raw_fd_ostream os(bc, ec, llvm::sys::fs::OF_None);
+            if (ec)
+                return false;
+            llvm::WriteBitcodeToFile(*module(), os);
+        }
+        std::string cmd = OIIO::Strutil::fmt::format("\"{}\" \"{}\" \"{}\"",
+                                                     emitter, bc, spv);
+        int rc = system(cmd.c_str());
+        std::string spv_bytes;
+        bool ok = rc == 0
+                  && OIIO::Filesystem::read_text_file(spv, spv_bytes)
+                  && spv_bytes.size() % sizeof(uint32_t) == 0
+                  && spv_bytes.size();
+        OIIO::Filesystem::remove(bc);
+        OIIO::Filesystem::remove(spv);
+        if (!ok)
+            return false;
+        out.resize(spv_bytes.size() / sizeof(uint32_t));
+        memcpy(out.data(), spv_bytes.data(), spv_bytes.size());
+        return true;
+    }
+
+    llvm::legacy::PassManager mpm;
+    llvm::SmallString<4096> binary;
+    llvm::raw_svector_ostream binary_stream(binary);
+#    if OSL_LLVM_VERSION >= 180
+    if (target_machine->addPassesToEmitFile(mpm, binary_stream, nullptr,
+                                            llvm::CodeGenFileType::ObjectFile))
+        return false;
+#    else
+    if (target_machine->addPassesToEmitFile(mpm, binary_stream, nullptr,
+                                            llvm::CGFT_ObjectFile))
+        return false;
+#    endif
+    // LLVM's SPIR-V backend is young, and crashes on some input. Don't let
+    // that take down the renderer; report it as a failed compile.
+    static std::once_flag recovery_once;
+    std::call_once(recovery_once, [] { llvm::CrashRecoveryContext::Enable(); });
+    llvm::CrashRecoveryContext recovery;
+    if (!recovery.RunSafely([&] { mpm.run(*module()); }))
+        return false;
+    if (binary.size() % sizeof(uint32_t))
+        return false;
+    out.resize(binary.size() / sizeof(uint32_t));
+    memcpy(out.data(), binary.data(), binary.size());
     return true;
 #else
     return false;

@@ -410,7 +410,7 @@ filefmt(OpaqueExecContextPtr oec, const FilenameT& filename_hash,
     };
 
     rs_filefmt(oec, OSL::ustringhash { filename_hash },
-               OSL::ustringhash { fmt_specification }, count,
+               pvt::fmt_specification_hash(fmt_specification), count,
                (count == 0) ? nullptr : argTypes,
                static_cast<uint32_t>((count == 0) ? 0 : sizeof(argValues)),
                (count == 0) ? nullptr : reinterpret_cast<uint8_t*>(&argValues));
@@ -428,7 +428,7 @@ printfmt(OpaqueExecContextPtr oec, const SpecifierT& fmt_specification,
         pvt::TypeEncoder<ArgListT>::Encode(args)...
     };
 
-    rs_printfmt(oec, OSL::ustringhash { fmt_specification }, count,
+    rs_printfmt(oec, pvt::fmt_specification_hash(fmt_specification), count,
                 (count == 0) ? nullptr : argTypes,
                 static_cast<uint32_t>((count == 0) ? 0 : sizeof(argValues)),
                 (count == 0) ? nullptr
@@ -447,7 +447,7 @@ errorfmt(OpaqueExecContextPtr oec, const SpecifierT& fmt_specification,
         pvt::TypeEncoder<ArgListT>::Encode(args)...
     };
 
-    rs_errorfmt(oec, OSL::ustringhash { fmt_specification }, count,
+    rs_errorfmt(oec, pvt::fmt_specification_hash(fmt_specification), count,
                 (count == 0) ? nullptr : argTypes,
                 static_cast<uint32_t>((count == 0) ? 0 : sizeof(argValues)),
                 (count == 0) ? nullptr
@@ -466,7 +466,7 @@ warningfmt(OpaqueExecContextPtr oec, const SpecifierT& fmt_specification,
         pvt::TypeEncoder<ArgListT>::Encode(args)...
     };
 
-    rs_warningfmt(oec, OSL::ustringhash { fmt_specification }, count,
+    rs_warningfmt(oec, pvt::fmt_specification_hash(fmt_specification), count,
                   (count == 0) ? nullptr : argTypes,
                   static_cast<uint32_t>((count == 0) ? 0 : sizeof(argValues)),
                   (count == 0) ? nullptr

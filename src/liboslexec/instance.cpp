@@ -805,6 +805,7 @@ ShaderGroup::clear_entry_layers()
     for (int i = 0; i < nlayers(); ++i)
         m_layers[i]->entry_layer(false);
     m_num_entry_layers = 0;
+    m_entry_layer_order.clear();
 }
 
 
@@ -815,6 +816,7 @@ ShaderGroup::mark_entry_layer(int layer)
     if (layer >= 0 && layer < nlayers() && !m_layers[layer]->entry_layer()) {
         m_layers[layer]->entry_layer(true);
         ++m_num_entry_layers;
+        m_entry_layer_order.push_back(layer);
     }
 }
 

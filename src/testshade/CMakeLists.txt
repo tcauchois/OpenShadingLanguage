@@ -12,6 +12,10 @@ if (OSL_BUILD_BATCHED)
         batched_simplerend.cpp)
 endif()
 
+if (OSL_USE_VULKAN)
+    list (APPEND testshade_srcs vulkangridrender.cpp)
+endif ()
+
 if (OSL_USE_OPTIX)
     list (APPEND testshade_srcs optixgridrender.cpp)
     set ( testshade_cuda_srcs
@@ -82,6 +86,9 @@ target_include_directories (testshade BEFORE PRIVATE ${OpenImageIO_INCLUDES})
 target_link_libraries (testshade
                        PRIVATE
                            oslexec oslquery oslcomp)
+if (OSL_USE_VULKAN)
+    target_link_libraries (testshade PRIVATE oslvkcompute)
+endif ()
 if (OSL_USE_OPTIX)
     add_dependencies(testshade testshade_ptx)
 endif ()
@@ -120,6 +127,9 @@ if (NOT CODECOV)
     target_link_libraries (libtestshade
                            PRIVATE
                                oslexec oslquery oslcomp)
+    if (OSL_USE_VULKAN)
+        target_link_libraries (libtestshade PRIVATE oslvkcompute)
+    endif ()
     target_include_directories (libtestshade BEFORE PRIVATE ${OpenImageIO_INCLUDES})
     set_target_properties (libtestshade PROPERTIES PREFIX "")
 

@@ -351,6 +351,93 @@ Matrix44 OSL_HOSTDEVICE nonAffineInverse(const Matrix44 &source)
 }
 
 
+// Matrix44 inverse without runtime row indexing, for GPU targets whose
+// memory model can't address rows chosen at run time (e.g., SPIR-V with
+// logical addressing). Same algorithm and results as Imath's inverse():
+// the affine fast path, else Gauss-Jordan elimination with partial
+// pivoting. The pivot row swap is done element by element with every
+// index a compile-time constant after unrolling.
+static OSL_FORCEINLINE OSL_HOSTDEVICE Matrix44
+fixedIndexInverse(const Matrix44& source)
+{
+    using ScalarT = typename Matrix44::BaseType;
+    if (test_if_affine(source)) {
+        // Imath's affine path returns the identity when the matrix is
+        // nearly singular, which affineInverse does too.
+        return affineInverse(source);
+    }
+
+    Matrix44 t(source);
+    Matrix44 s;
+
+    // Forward elimination
+#pragma unroll
+    for (int i = 0; i < 3; i++) {
+        int pivot         = i;
+        ScalarT pivotsize = std::abs(t.x[i][i]);
+#pragma unroll
+        for (int j = i + 1; j < 4; j++) {
+            ScalarT tmp = std::abs(t.x[j][i]);
+            if (tmp > pivotsize) {
+                pivot     = j;
+                pivotsize = tmp;
+            }
+        }
+        if (pivotsize == 0)
+            return Matrix44();
+
+        // Swap rows i and pivot: each row j > i swaps with row i if it's
+        // the pivot row.
+#pragma unroll
+        for (int j = i + 1; j < 4; j++) {
+            bool swap = (pivot == j);
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                ScalarT ti = t.x[i][k], tj = t.x[j][k];
+                t.x[i][k]  = swap ? tj : ti;
+                t.x[j][k]  = swap ? ti : tj;
+                ScalarT si = s.x[i][k], sj = s.x[j][k];
+                s.x[i][k]  = swap ? sj : si;
+                s.x[j][k]  = swap ? si : sj;
+            }
+        }
+
+#pragma unroll
+        for (int j = i + 1; j < 4; j++) {
+            ScalarT f = t.x[j][i] / t.x[i][i];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                t.x[j][k] -= f * t.x[i][k];
+                s.x[j][k] -= f * s.x[i][k];
+            }
+        }
+    }
+
+    // Backward substitution
+#pragma unroll
+    for (int i = 3; i >= 0; --i) {
+        ScalarT f = t.x[i][i];
+        if (f == 0)
+            return Matrix44();
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            t.x[i][j] /= f;
+            s.x[i][j] /= f;
+        }
+#pragma unroll
+        for (int j = 0; j < i; j++) {
+            f = t.x[j][i];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                t.x[j][k] -= f * t.x[i][k];
+                s.x[j][k] -= f * s.x[i][k];
+            }
+        }
+    }
+    return s;
+}
+
+
 // In order to have inlinable Matrix44*float
 // Override with a more specific version than
 // template <class T>

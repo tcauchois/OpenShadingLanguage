@@ -3,6 +3,8 @@
 // https://github.com/AcademySoftwareFoundation/OpenShadingLanguage
 
 #include <bitset>
+#include <set>
+#include <mutex>
 #include <cmath>
 #include <iostream>
 #include <unordered_map>
@@ -20,6 +22,18 @@
 
 #include "oslexec_pvt.h"
 #include "backendllvm.h"
+#include "spirv_callbacks.h"
+#include "spirv_passes.h"
+
+#include <llvm/IR/AttributeMask.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/ReplaceConstant.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 
 #if OSL_USE_OPTIX
 #    include <llvm/Linker/Linker.h>
@@ -120,6 +134,11 @@ extern unsigned char osl_llvm_compiled_ops_block[];
 
 extern int osl_llvm_compiled_rs_dependent_ops_size;
 extern unsigned char osl_llvm_compiled_rs_dependent_ops_block[];
+
+#if OSL_USE_VULKAN
+extern int osl_llvm_compiled_spirv_ops_size;
+extern unsigned char osl_llvm_compiled_spirv_ops_block[];
+#endif
 
 #ifdef OSL_LLVM_CUDA_BITCODE
 extern int shadeops_cuda_llvm_compiled_ops_size;
@@ -254,7 +273,10 @@ BackendLLVM::llvm_type_sg()
     sg_types.push_back(ll.type_triple());  // dPdtime
     sg_types.push_back(triple_deriv);      // Ps
 
-    llvm::Type* vp = (llvm::Type*)ll.type_void_ptr();
+    // Pointers in the ShaderGlobals are opaque 64-bit handles for SPIR-V,
+    // which (with logical addressing) has no pointers in memory.
+    llvm::Type* vp = use_spirv() ? ll.type_longlong()
+                                 : (llvm::Type*)ll.type_void_ptr();
     sg_types.push_back(vp);             // opaque renderstate*
     sg_types.push_back(vp);             // opaque tracedata*
     sg_types.push_back(vp);             // opaque objdata*
@@ -403,6 +425,23 @@ BackendLLVM::llvm_type_groupdata()
             ++order;
         }
     }
+    // SPIR-V: the pool that the group's closures are built in (see
+    // rs_spirv.cpp): a count of used words, then the words.
+    m_spirv_closure_pool_field = -1;
+    m_spirv_closure_pool_words = 0;
+    if (use_spirv()) {
+        if (int words = spirv_closure_pool_size()) {
+            m_spirv_closure_pool_words = words;
+            offset = OIIO::round_to_multiple_of_pow2(offset, 4);
+            fields.push_back(ll.type_struct(
+                { ll.type_int(), ll.type_array(ll.type_int(), words) },
+                "OSLClosurePool"));
+            m_groupdata_field_names.emplace_back("closure_pool");
+            m_spirv_closure_pool_field = order++;
+            offset += 4 * (1 + words);
+        }
+    }
+
     group().llvm_groupdata_size(offset);
     if (llvm_debug() >= 2)
         print(" Group struct had {} fields, total size {}\n\n", order, offset);
@@ -711,12 +750,17 @@ BackendLLVM::llvm_create_constant(const Symbol& sym)
                 const_element = ll.constant(sym.get_int(linear_index));
             }
             if (sym.typespec().is_string_based()) {
-                // TODO:  right now stored as char *, but change to int64 when we can
-                const_element = reinterpret_cast<llvm::Constant*>(
-                    ll.constant_ptr(
-                        OSL::bitcast<char*>(
-                            ustring(sym.get_string(linear_index)).hash()),
-                        ll.type_char_ptr()));
+                uint64_t hash = ustring(sym.get_string(linear_index)).hash();
+                if (use_spirv()) {
+                    // SPIR-V can't represent pointer constants; strings are
+                    // their hashes on the GPU anyway (see llvm_typedesc).
+                    const_element = ll.constant64(hash);
+                } else {
+                    // TODO:  right now stored as char *, but change to int64 when we can
+                    const_element = reinterpret_cast<llvm::Constant*>(
+                        ll.constant_ptr(OSL::bitcast<char*>(hash),
+                                        ll.type_char_ptr()));
+                }
             }
             OSL_ASSERT(const_element && "unhandled type");
             elements.push_back(const_element);
@@ -904,7 +948,7 @@ BackendLLVM::llvm_assign_initial_value(const Symbol& sym, bool force)
                     // *userdata_initialized = status;
                     ll.op_store(ll.op_int_to_int8(status),
                                 userdata_initializedPtr);
-                    if (!use_optix() && shadingsys().m_statslevel != 0) {
+                    if (!use_gpu() && shadingsys().m_statslevel != 0) {
                         // sg->context->incr_get_userdata_calls();
                         ll.call_function("osl_incr_get_userdata_calls",
                                          sg_void_ptr());
@@ -1349,6 +1393,12 @@ BackendLLVM::build_llvm_init()
                      4 /*align*/);
     }
 
+    // SPIR-V: empty the closure pool.
+    if (m_spirv_closure_pool_field >= 0)
+        ll.op_store(ll.constant(0),
+                    ll.GEP(llvm_type_groupdata(), m_llvm_groupdata_ptr, 0,
+                           m_spirv_closure_pool_field, 0));
+
     // Group init also needs to allot space for ALL layers' params
     // that are closures (to avoid weird order of layer eval problems).
     for (int i = 0; i < group().nlayers(); ++i) {
@@ -1359,7 +1409,7 @@ BackendLLVM::build_llvm_init()
         {
             if (sym.typespec().is_closure_based()) {
                 int arraylen     = std::max(1, sym.typespec().arraylength());
-                llvm::Value* val = ll.constant_ptr(NULL, ll.type_void_ptr());
+                llvm::Value* val = llvm_null_closure();
                 for (int a = 0; a < arraylen; ++a) {
                     llvm::Value* arrind = sym.typespec().is_array()
                                               ? ll.constant(a)
@@ -1802,11 +1852,12 @@ BackendLLVM::build_llvm_instance(bool groupentry)
     }
     // llvm_gen_debug_printf ("done copying connections");
 
-    // Copy results to renderer outputs
+    // Copy results to renderer outputs. (For SPIR-V, renderer outputs are
+    // read from the groupdata by the caller of the entry point.)
     llvm::Value* sindex = nullptr;
     FOREACH_PARAM(Symbol & s, inst())
     {
-        if (!s.renderer_output())  // Skip if not a renderer output
+        if (!s.renderer_output() || use_spirv())
             continue;
         auto symloc = group().find_symloc(s.name(), inst()->layername(),
                                           SymArena::Outputs);
@@ -1882,10 +1933,10 @@ BackendLLVM::initialize_llvm_group()
     }
 
     // Set up optimization passes. Don't target the host if we're building
-    // for OptiX.
+    // for a GPU.
     ll.setup_optimization_passes(shadingsys().llvm_optimize(),
                                  shadingsys().llvm_target_host()
-                                     && !use_optix());
+                                     && !use_gpu());
 
     // Clear the shaderglobals and groupdata types -- they will be
     // created on demand.
@@ -1898,8 +1949,8 @@ BackendLLVM::initialize_llvm_group()
 
     initialize_llvm_helper_function_map();
 
-    // Skipping this in the non-JIT OptiX case suppresses an LLVM warning
-    if (!use_optix())
+    // Skipping this in the non-JIT GPU case suppresses an LLVM warning
+    if (!use_gpu())
         ll.InstallLazyFunctionCreator(helper_function_lookup);
 
     for (HelperFuncMap::iterator i = llvm_helper_function_map.begin(),
@@ -1923,18 +1974,16 @@ BackendLLVM::initialize_llvm_group()
             }
             types += advance;
         }
-#if OSL_USE_OPTIX
-        if (varargs && use_optix()) {
+        if (varargs && use_gpu()) {
             varargs = false;
             params.push_back(ll.type_void_ptr());
         }
-#endif
         llvm::Function* f = ll.make_function(funcname, false,
                                              llvm_pass_type(rettype), params,
                                              varargs);
 
-        // Skipping this in the non-JIT OptiX case suppresses an LLVM warning
-        if (!use_optix())
+        // Skipping this in the non-JIT GPU case suppresses an LLVM warning
+        if (!use_gpu())
             ll.add_function_mapping(f, (void*)i->second.function);
     }
 
@@ -2082,7 +2131,7 @@ empty_group_func(void*, void*)
 void
 BackendLLVM::run()
 {
-    if (group().does_nothing()) {
+    if (group().does_nothing() && !use_spirv()) {
         group().llvm_compiled_init((RunLLVMGroupFunc)empty_group_func);
         group().llvm_compiled_version((RunLLVMGroupFunc)empty_group_func);
         return;
@@ -2124,7 +2173,49 @@ BackendLLVM::run()
         }
 #    endif
 #else
-        if (!use_optix()) {
+        if (use_spirv()) {
+#    if OSL_USE_VULKAN
+            // The SPIR-V shadeops are compiled for the host with SIMD
+            // disabled; retarget them. Their struct layouts match, since
+            // SPIR-V and the host have the same scalar alignments.
+            ll.module(ll.module_from_bitcode(
+                (char*)osl_llvm_compiled_spirv_ops_block,
+                osl_llvm_compiled_spirv_ops_size, "osl_spirv", &err));
+            if (err.length())
+                shadingcontext()->errorfmt(
+                    "llvm::parseBitcodeFile returned '{}' for spirv llvm_ops\n",
+                    err);
+            // Messages from the shadeops (e.g., errors) are decoded on the
+            // host by looking up their format strings by hash, so make sure
+            // the host knows all of the shadeops' string literals. (Those
+            // that are only hashed are kept alive by passing them to
+            // osl_spirv_intern_string, which we then define to do nothing.
+            // The module is materialized lazily, so leave the calls alone.)
+            static std::once_flag intern_once;
+            std::call_once(intern_once, [&] {
+                for (llvm::GlobalVariable& g : ll.module()->globals())
+                    if (auto* data = llvm::dyn_cast_or_null<
+                            llvm::ConstantDataSequential>(
+                            g.hasInitializer() ? g.getInitializer() : nullptr))
+                        if (data->isCString())
+                            ustring(data->getAsCString().str());
+            });
+            if (llvm::Function* intern = ll.module()->getFunction(
+                    "osl_spirv_intern_string")) {
+                intern->setLinkage(llvm::GlobalValue::InternalLinkage);
+                intern->addFnAttr(llvm::Attribute::AlwaysInline);
+                llvm::ReturnInst::Create(
+                    ll.context(),
+                    llvm::BasicBlock::Create(ll.context(), "", intern));
+            }
+            ll.module()->setDataLayout(spirv_data_layout);
+#        if OSL_LLVM_VERSION < 210
+            ll.module()->setTargetTriple(spirv_triple);
+#        else
+            ll.module()->setTargetTriple(llvm::Triple(spirv_triple));
+#        endif
+#    endif
+        } else if (!use_optix()) {
             if (use_rs_bitcode()) {
                 ll.module(ll.module_from_bitcode(
                     (char*)osl_llvm_compiled_rs_dependent_ops_block,
@@ -2279,6 +2370,8 @@ BackendLLVM::run()
         // it's still useful to set the target ISA to facilitate PTX-specific codegen.
         if (use_optix()) {
             ll.set_target_isa(TargetISA::NVPTX);
+        } else if (use_spirv()) {
+            ll.set_target_isa(TargetISA::SPIRV);
         } else if (!ll.make_jit_execengine(
                        &err,
                        ll.lookup_isa_by_name(shadingsys().m_llvm_jit_target),
@@ -2319,6 +2412,8 @@ BackendLLVM::run()
     shadingsys().m_stat_empty_instances += nlayers - m_num_used_layers;
 
     initialize_llvm_group();
+    if (use_spirv())
+        assign_spirv_message_slots();
 
     // Generate the LLVM IR for each layer.  Skip unused layers.
     m_llvm_local_mem          = 0;
@@ -2338,6 +2433,8 @@ BackendLLVM::run()
     std::vector<llvm::Function*> optix_externals;
     if (use_optix())
         optix_externals = build_llvm_optix_callables();
+    else if (use_spirv())
+        optix_externals.push_back(build_llvm_spirv_entry());
 
     // llvm::Function* entry_func = group().num_entry_layers() ? NULL : funcs[m_num_used_layers-1];
     m_stat_llvm_irgen_time += timer.lap();
@@ -2368,7 +2465,7 @@ BackendLLVM::run()
         // seems to yield about another 5-10% opt+JIT speed gain versus
         // merely internalizing.
         std::unordered_set<llvm::Function*> external_functions;
-        if (use_optix()) {
+        if (use_gpu()) {
             for (llvm::Function* func : optix_externals)
                 external_functions.insert(func);
         } else {
@@ -2430,8 +2527,12 @@ BackendLLVM::run()
     }
 #endif
 
-    // Optimize the LLVM IR unless it's a do-nothing group.
-    if (!group().does_nothing()) {
+    if (use_spirv())
+        prepare_module_for_spirv();
+
+    // Optimize the LLVM IR unless it's a do-nothing group. (SPIR-V always
+    // needs the optimizer to inline everything into the entry point.)
+    if (!group().does_nothing() || use_spirv()) {
         ll.do_optimize();
     }
 
@@ -2500,7 +2601,9 @@ BackendLLVM::run()
         }
     } else
 #endif
-    {
+    if (use_spirv()) {
+        finalize_spirv(optix_externals[0]);
+    } else {
         // Force the JIT to happen now and retrieve the JITed function pointers
         // for the initialization and all public entry points.
         group().llvm_compiled_init(

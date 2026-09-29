@@ -28,6 +28,8 @@ namespace pvt {  // OSL::pvt
 
 /// OSOProcessor that generates LLVM IR and JITs it to give machine
 /// code to implement a shader group.
+struct SpirvCallback;
+
 class BackendLLVM final : public OSOProcessorBase {
 public:
     BackendLLVM(ShadingSystemImpl& shadingsys, ShaderGroup& group,
@@ -43,6 +45,21 @@ public:
 
     /// Set additional Module/Function options for the CUDA/OptiX target.
     void prepare_module_for_cuda_jit();
+
+    /// Set Module/Function options for the SPIR-V target: everything is
+    /// inlined into the single exported entry point.
+    void prepare_module_for_spirv();
+
+    /// After optimization, make the module compilable for SPIR-V and
+    /// compile it, storing the result in the group.
+    void finalize_spirv(llvm::Function* entry);
+
+    /// LLVM type of the struct parameter of a renderer callback.
+    llvm::Type* spirv_callback_struct(const SpirvCallback& cb);
+
+    /// A constant of `type` with the given memory image.
+    llvm::Constant* constant_from_bytes(llvm::Type* type,
+                                        const uint8_t* bytes);
 
 
 
@@ -65,6 +82,76 @@ public:
     // Create llvm functions for OptiX callables
     std::vector<llvm::Function*> build_llvm_optix_callables();
     llvm::Function* build_llvm_fused_callable();
+
+    // Create the exported SPIR-V entry point (see spirv_entry_name)
+    llvm::Function* build_llvm_spirv_entry();
+
+    /// For SPIR-V: if every message name in the group is a constant, give
+    /// each name a slot (see rs_spirv.cpp) sized for its largest value.
+    void assign_spirv_message_slots();
+
+    /// The slot for a SPIR-V message name: its header and data globals.
+    struct SpirvMessageSlot {
+        llvm::GlobalVariable* header = nullptr;
+        llvm::GlobalVariable* data   = nullptr;
+    };
+
+    /// The slot for a SPIR-V message name, or nullptr if messages use the
+    /// table instead.
+    const SpirvMessageSlot* spirv_message_slot(ustring name);
+
+    /// The "no closure" value: a null pointer, or a 0 handle for SPIR-V.
+    llvm::Value* llvm_null_closure()
+    {
+        return use_spirv() ? (llvm::Value*)ll.constant64(uint64_t(0))
+                           : ll.constant_ptr(NULL, ll.type_void_ptr());
+    }
+
+    /// For SPIR-V: the group's closure pool (in the groupdata), sized from
+    /// the closure operations of the group (see llvm_type_groupdata).
+    llvm::Value* spirv_closure_pool();
+    /// The arguments that pass the closure pool to the SPIR-V closure
+    /// shadeops: its used count, words, and capacity.
+    std::vector<llvm::Value*> spirv_closure_pool_args();
+    int spirv_closure_pool_size();
+    /// For printf of a SPIR-V closure: ask the renderer to format it (see
+    /// osl_spirv_print_closure), returning the placeholder string hash
+    /// that its message decoding replaces with the formatted closure.
+    llvm::Value* llvm_spirv_print_closure(llvm::Value* closure, int opnum,
+                                          int element);
+    /// The groupdata's closure pool type, or nullptr.
+    llvm::Type* spirv_closure_pool_type();
+
+    /// Code generation for the closure and message ops (called from
+    /// llvm_gen.cpp), in llvm_spirv.cpp.
+    /// The sum of two closure handles.
+    llvm::Value* spirv_add_closures(llvm::Value* a, llvm::Value* b);
+    /// A closure handle times a float (`tfloat`) or a pointer to a color.
+    llvm::Value* spirv_mul_closure(llvm::Value* closure, llvm::Value* weight,
+                                   bool tfloat);
+    /// Allocate a component for closure `entry` in the pool, returning its
+    /// handle (or nullptr, after reporting an error). `weight` points to
+    /// its color, or is null for 1.
+    llvm::Value* spirv_allocate_closure(
+        const ClosureRegistry::ClosureEntry& entry, const Opcode& op,
+        llvm::Value* weight);
+    /// Store `size` bytes of a component's params, at byte `offset`.
+    void spirv_closure_param(llvm::Value* handle, int offset,
+                             llvm::Value* src, int size);
+    /// getmessage/setmessage with a constant name use the name's slot. These
+    /// return nullptr/false if `name` has none. (`args` as for
+    /// osl_getmessage/osl_setmessage.)
+    llvm::Value* spirv_getmessage(const Symbol& name, llvm::Value* const* args);
+    bool spirv_setmessage(const Symbol& name, llvm::Value* const* args);
+    int m_spirv_closure_pool_field = -1;  ///< groupdata field, or -1
+    int m_spirv_closure_pool_words = 0;   ///< its capacity
+    int m_spirv_closure_max_nodes  = 0;   ///< most nodes it can hold
+
+    /// Generate Slang declarations matching the SPIR-V entry point's ABI
+    /// (ShaderGlobals, Groupdata, and eval_osl) so that renderer shaders
+    /// can call it; see ShaderGroup::m_spirv_slang_abi.
+    std::string spirv_slang_abi();
+    std::string spirv_slang_closures();
 
     /// Build up LLVM IR code for the given range [begin,end) or
     /// opcodes, putting them (initially) into basic block bb (or the
@@ -263,6 +350,7 @@ public:
     /// Convert the name of a global (and its derivative index) into the
     /// field number of the ShaderGlobals struct.
     int ShaderGlobalNameToIndex(ustring name);
+    ustring ShaderGlobalIndexToName(int index);
 
     /// Return the LLVM type handle for the ShaderGlobals struct.
     ///
@@ -444,10 +532,14 @@ public:
 
     TypeDesc llvm_typedesc(const TypeSpec& typespec)
     {
+        // SPIR-V closures are 64-bit handles into the group's closure pool
+        // (see rs_spirv.cpp), the same size as the host's pointers.
+        if (typespec.is_closure_based() && use_spirv())
+            return TypeDesc(TypeDesc::UINT64, typespec.arraylength());
         if (typespec.is_closure_based())
             return TypeDesc(TypeDesc::PTR, typespec.arraylength());
-        else if (use_optix() && typespec.is_string_based()) {
-            // On the OptiX side, we use the uint64 hash to represent a string
+        else if (use_gpu() && typespec.is_string_based()) {
+            // On the GPU side, we use the uint64 hash to represent a string
             return TypeDesc(TypeDesc::UINT64, typespec.arraylength());
         } else
             return typespec.simpletype();
@@ -526,6 +618,12 @@ public:
     bool use_optix() { return m_use_optix; }
     bool use_optix_cache() { return shadingsys().use_optix_cache(); }
 
+    /// Return whether or not we are compiling SPIR-V for a Vulkan renderer.
+    bool use_spirv() { return m_use_spirv; }
+
+    /// Return whether or not we are compiling for any GPU target.
+    bool use_gpu() { return m_use_optix || m_use_spirv; }
+
     /// Return if we should compile against free function versions of Renderer Service.
     bool use_rs_bitcode() { return m_use_rs_bitcode; }
 
@@ -594,7 +692,11 @@ private:
     // Name of each indexed field in the groupdata, mostly for debugging.
     std::vector<std::string> m_groupdata_field_names;
 
+    // SPIR-V message slots, by message name (see assign_spirv_message_slots)
+    std::map<ustring, SpirvMessageSlot> m_spirv_message_slots;
+
     bool m_use_optix;  ///< Compile for OptiX?
+    bool m_use_spirv;  ///< Compile SPIR-V for Vulkan?
     bool m_use_rs_bitcode;  /// To use free function versions of Renderer Service functions.
 
     friend class ShadingSystemImpl;

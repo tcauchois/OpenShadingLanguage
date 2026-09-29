@@ -6,3 +6,9 @@
 
 command += testshade("-g 256 256 --center -od uint8 -o Cout out.tif test")
 outputs = [ "out.txt", "out.tif" ]
+
+# Vulkan: The GPU approximates blur by widening the filter footprint.
+if os.environ.get("TESTSHADE_VULKAN") :
+    failthresh = 0.05
+    failpercent = 0.25
+    hardfail = 0.1

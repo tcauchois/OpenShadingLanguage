@@ -1129,6 +1129,7 @@ ShadingSystemImpl::ShadingSystemImpl(RendererServices* renderer,
     , m_compile_report(0)
     , m_use_optix(renderer->supports("OptiX"))
     , m_use_optix_cache(m_use_optix && renderer->supports("optix_ptx_cache"))
+    , m_use_spirv(renderer->supports("SPIRV"))
     , m_max_optix_groupdata_alloc(0)
     , m_buffer_printf(true)
     , m_no_noise(false)
@@ -1504,7 +1505,7 @@ ShadingSystemImpl::query_closure(const char** name, int* id,
     const ClosureRegistry::ClosureEntry* entry
         = (name && *name) ? m_closure_registry.get_entry(ustring(*name))
                           : m_closure_registry.get_entry(*id);
-    if (!entry)
+    if (!entry || entry->name.empty())
         return false;
 
     if (name)
@@ -1662,6 +1663,7 @@ ShadingSystemImpl::attribute(string_view name, TypeDesc type, const void* val)
     ATTR_SET("dump_varying_symbols", int, m_dump_varying_symbols);
     ATTR_SET_STRING("llvm_prune_ir_strategy", m_llvm_prune_ir_strategy);
     ATTR_SET("strict_messages", int, m_strict_messages);
+    ATTR_SET("spirv_closure_pool_words", int, m_spirv_closure_pool_words);
     ATTR_SET("range_checking", int, m_range_checking);
     ATTR_SET("unknown_coordsys_error", int,
              m_shading_state_uniform.m_unknown_coordsys_error);
@@ -1853,6 +1855,7 @@ ShadingSystemImpl::getattribute(string_view name, TypeDesc type, void* val)
     ATTR_DECODE("dump_uniform_symbols", int, m_dump_uniform_symbols);
     ATTR_DECODE("dump_varying_symbols", int, m_dump_varying_symbols);
     ATTR_DECODE("strict_messages", int, m_strict_messages);
+    ATTR_DECODE("spirv_closure_pool_words", int, m_spirv_closure_pool_words);
     ATTR_DECODE("error_repeats", int, m_error_repeats);
     ATTR_DECODE("range_checking", int, m_range_checking);
     ATTR_DECODE("unknown_coordsys_error", int,
@@ -2191,8 +2194,24 @@ ShadingSystemImpl::getattribute(ShaderGroup* group, string_view name,
         *(std::string*)val = exists ? group->m_llvm_ptx_compiled_version : "";
         return true;
     }
+    if (name == "spirv_compiled_version" && type.basetype == TypeDesc::PTR) {
+        *(std::vector<uint32_t>*)val = group->m_llvm_spirv_compiled_version;
+        return true;
+    }
+    if (name == "spirv_slang_abi" && type.basetype == TypeDesc::PTR) {
+        *(std::string*)val = group->m_spirv_slang_abi;
+        return true;
+    }
+    if (name == "spirv_output_fields" && type.basetype == TypeDesc::PTR) {
+        *(std::vector<std::string>*)val = group->m_spirv_output_fields;
+        return true;
+    }
     if (name == "interactive_params" && type.basetype == TypeDesc::PTR) {
         *(void**)val = group->m_interactive_arena.get();
+        return true;
+    }
+    if (name == "interactive_params_size" && type == TypeInt) {
+        *(int*)val = int(group->m_interactive_arena_size);
         return true;
     }
     if (name == "device_interactive_params" && type.basetype == TypeDesc::PTR) {

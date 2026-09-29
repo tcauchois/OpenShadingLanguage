@@ -663,8 +663,11 @@ LLVMGEN(llvm_gen_print_fmt)
 
                     llvm::Value* v = rop.llvm_load_value(sym, 0, const_arrind,
                                                          0);
-                    v = rop.ll.call_function("osl_closure_to_ustringhash",
-                                             rop.sg_void_ptr(), v);
+                    if (rop.use_spirv())
+                        v = rop.llvm_spirv_print_closure(v, opnum, a);
+                    else
+                        v = rop.ll.call_function("osl_closure_to_ustringhash",
+                                                 rop.sg_void_ptr(), v);
                     encodedtypes.push_back(et);
                     arg_values_size += pvt::size_of_encoded_type(et);
                     loaded_arg_values.push_back(v);
@@ -805,6 +808,18 @@ LLVMGEN(llvm_gen_print_fmt)
 
 LLVMGEN(llvm_gen_printf)
 {
+    if (rop.use_spirv()) {
+        // Messages are recorded, with their arguments, for the host to
+        // format. But format() makes a new string, which a GPU can't.
+        Opcode& op(rop.inst()->ops()[opnum]);
+        if (op.opname() == op_format) {
+            rop.shadingcontext()->errorfmt(
+                "format() creates a new string, which isn't supported for SPIR-V ({}:{})",
+                op.sourcefile(), op.sourceline());
+            return false;
+        }
+        return llvm_gen_print_fmt(rop, opnum);
+    }
     if (rop.use_optix())
         return llvm_gen_printf_legacy(rop, opnum);
     else
@@ -822,10 +837,16 @@ LLVMGEN(llvm_gen_add)
     OSL_DASSERT(!A.typespec().is_array() && !B.typespec().is_array());
     if (Result.typespec().is_closure()) {
         OSL_DASSERT(A.typespec().is_closure() && B.typespec().is_closure());
-        llvm::Value* valargs[] = { rop.sg_void_ptr(), rop.llvm_load_value(A),
-                                   rop.llvm_load_value(B) };
-        llvm::Value* res       = rop.ll.call_function("osl_add_closure_closure",
-                                                      valargs);
+        llvm::Value* res;
+        if (rop.use_spirv()) {
+            res = rop.spirv_add_closures(rop.llvm_load_value(A),
+                                         rop.llvm_load_value(B));
+        } else {
+            llvm::Value* valargs[] = { rop.sg_void_ptr(),
+                                       rop.llvm_load_value(A),
+                                       rop.llvm_load_value(B) };
+            res = rop.ll.call_function("osl_add_closure_closure", valargs);
+        }
         rop.llvm_store_value(res, Result, 0, NULL, 0);
         return true;
     }
@@ -934,9 +955,14 @@ LLVMGEN(llvm_gen_mul)
             valargs[1] = rop.llvm_load_value(B);
             valargs[2] = tfloat ? rop.llvm_load_value(A) : rop.llvm_void_ptr(A);
         }
-        llvm::Value* res
-            = tfloat ? rop.ll.call_function("osl_mul_closure_float", valargs)
-                     : rop.ll.call_function("osl_mul_closure_color", valargs);
+        llvm::Value* res;
+        if (rop.use_spirv()) {
+            res = rop.spirv_mul_closure(valargs[1], valargs[2], tfloat);
+        } else {
+            res = tfloat
+                      ? rop.ll.call_function("osl_mul_closure_float", valargs)
+                      : rop.ll.call_function("osl_mul_closure_color", valargs);
+        }
         rop.llvm_store_value(res, Result, 0, NULL, 0);
         return true;
     }
@@ -1117,7 +1143,7 @@ LLVMGEN(llvm_gen_modulus)
         if (!a || !b)
             return false;
         llvm::Value* r;
-        if (!rop.use_optix() && B.is_constant() && !rop.is_zero(B))
+        if (!rop.use_gpu() && B.is_constant() && !rop.is_zero(B))
             r = rop.ll.op_mod(a, b);
         else
             r = rop.ll.call_function(safe_mod, a, b);
@@ -2196,7 +2222,7 @@ LLVMGEN(llvm_gen_compare_op)
         OSL_ASSERT(B.typespec().is_int()
                    && "Only closure==0 and closure!=0 allowed");
         llvm::Value* a = rop.llvm_load_value(A);
-        llvm::Value* b = rop.ll.void_ptr_null();
+        llvm::Value* b = rop.llvm_null_closure();
         llvm::Value* r = (op.opname() == op_eq) ? rop.ll.op_eq(a, b)
                                                 : rop.ll.op_ne(a, b);
         // Convert the single bit bool into an int
@@ -2817,7 +2843,8 @@ LLVMGEN(llvm_gen_texture)
                                    errormessage);
 
     RendererServices::TextureHandle* texture_handle = NULL;
-    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()
+        && !rop.use_spirv()) {
         texture_handle
             = rop.renderer()->get_texture_handle(Filename.get_string(),
                                                  rop.shadingcontext(), nullptr);
@@ -2884,7 +2911,8 @@ LLVMGEN(llvm_gen_texture3d)
                                    errormessage);
 
     RendererServices::TextureHandle* texture_handle = NULL;
-    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()
+        && !rop.use_spirv()) {
         texture_handle
             = rop.renderer()->get_texture_handle(Filename.get_string(),
                                                  rop.shadingcontext(), nullptr);
@@ -2949,7 +2977,8 @@ LLVMGEN(llvm_gen_environment)
                                    errormessage);
 
     RendererServices::TextureHandle* texture_handle = NULL;
-    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()
+        && !rop.use_spirv()) {
         texture_handle
             = rop.renderer()->get_texture_handle(Filename.get_string(),
                                                  rop.shadingcontext(), nullptr);
@@ -3292,7 +3321,7 @@ LLVMGEN(llvm_gen_noise)
     if (Result.has_derivs() && !derivs)
         rop.llvm_zero_derivs(Result);
 
-    if (rop.shadingsys().profile() >= 1)
+    if (rop.shadingsys().profile() >= 1 && !rop.use_gpu())
         rop.ll.call_function("osl_count_noise", rop.sg_void_ptr());
 
     return true;
@@ -3457,7 +3486,8 @@ LLVMGEN(llvm_gen_gettextureinfo)
         && !Data.typespec().is_closure_based() && Result.typespec().is_int());
 
     RendererServices::TextureHandle* texture_handle = NULL;
-    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()) {
+    if (Filename.is_constant() && rop.shadingsys().opt_texture_handle()
+        && !rop.use_spirv()) {
         texture_handle
             = rop.renderer()->get_texture_handle(Filename.get_string(),
                                                  rop.shadingcontext(), nullptr);
@@ -3557,7 +3587,11 @@ LLVMGEN(llvm_gen_getmessage)
     args[7] = rop.llvm_const_hash(op.sourcefile());
     args[8] = rop.ll.constant(op.sourceline());
 
-    llvm::Value* r = rop.ll.call_function("osl_getmessage", args);
+    // SPIR-V: messages with known names have their own slots.
+    llvm::Value* r = rop.use_spirv() ? rop.spirv_getmessage(Name, args)
+                                     : nullptr;
+    if (!r)
+        r = rop.ll.call_function("osl_getmessage", args);
     rop.llvm_store_value(r, Result);
     return true;
 }
@@ -3591,7 +3625,9 @@ LLVMGEN(llvm_gen_setmessage)
     args[5] = rop.llvm_const_hash(op.sourcefile());
     args[6] = rop.ll.constant(op.sourceline());
 
-    rop.ll.call_function("osl_setmessage", args);
+    // SPIR-V: messages with known names have their own slots.
+    if (!(rop.use_spirv() && rop.spirv_setmessage(Name, args)))
+        rop.ll.call_function("osl_setmessage", args);
     return true;
 }
 
@@ -3738,10 +3774,28 @@ LLVMGEN(llvm_gen_spline)
 
 
 
+// Store `size` bytes of a closure param from `src`: at `offset` bytes into
+// the param memory, or for SPIR-V, into the closure (handle) in the pool.
+static void
+llvm_gen_closure_param(BackendLLVM& rop, llvm::Value* mem_void_ptr,
+                       llvm::Value* spirv_handle, int offset, llvm::Value* src,
+                       int size)
+{
+    if (spirv_handle) {
+        rop.spirv_closure_param(spirv_handle, offset, src, size);
+    } else {
+        llvm::Value* dst = rop.ll.offset_ptr(mem_void_ptr, offset);
+        rop.ll.op_memcpy(dst, src, size, 4 /* use 4 byte alignment for now */);
+    }
+}
+
+
+
 static void
 llvm_gen_keyword_fill(BackendLLVM& rop, Opcode& op,
                       const ClosureRegistry::ClosureEntry* clentry,
-                      ustring clname, llvm::Value* mem_void_ptr, int argsoffset)
+                      ustring clname, llvm::Value* mem_void_ptr, int argsoffset,
+                      llvm::Value* spirv_handle = nullptr)
 {
     OSL_DASSERT(((op.nargs() - argsoffset) % 2) == 0);
 
@@ -3765,10 +3819,9 @@ llvm_gen_keyword_fill(BackendLLVM& rop, Opcode& op,
             if (equivalent(p.type, ValueType) && !strcmp(key.c_str(), p.key)) {
                 // store data
                 OSL_DASSERT(p.offset + p.field_size <= clentry->struct_size);
-                llvm::Value* dst = rop.ll.offset_ptr(mem_void_ptr, p.offset);
-                llvm::Value* src = rop.llvm_void_ptr(Value);
-                rop.ll.op_memcpy(dst, src, (int)p.type.size(),
-                                 4 /* use 4 byte alignment for now */);
+                llvm_gen_closure_param(rop, mem_void_ptr, spirv_handle,
+                                       p.offset, rop.llvm_void_ptr(Value),
+                                       (int)p.type.size());
                 legal = true;
                 break;
             }
@@ -3808,6 +3861,39 @@ LLVMGEN(llvm_gen_closure)
     }
 
     OSL_DASSERT(op.nargs() >= (2 + weighted + clentry->nformal));
+
+    if (rop.use_spirv()) {
+        // The closure is built in the group's closure pool (see
+        // rs_spirv.cpp), and its value is a handle.
+        llvm::Value* handle
+            = rop.spirv_allocate_closure(*clentry, op,
+                                         weighted ? rop.llvm_void_ptr(*weight)
+                                                  : nullptr);
+        if (!handle)
+            return false;
+        for (int carg = 0; carg < clentry->nformal; ++carg) {
+            const ClosureParam& p = clentry->params[carg];
+            if (p.key != NULL)
+                break;
+            Symbol& sym = *rop.opargsym(op, carg + 2 + weighted);
+            TypeDesc t  = sym.typespec().simpletype();
+            if (!sym.typespec().is_closure_array()
+                && !sym.typespec().is_structure() && equivalent(t, p.type)) {
+                llvm_gen_closure_param(rop, nullptr, handle, p.offset,
+                                       rop.llvm_void_ptr(sym),
+                                       (int)p.type.size());
+            } else {
+                rop.shadingcontext()->errorfmt(
+                    "Incompatible formal argument {} to '{}' closure ({} {}, expected {}). Prototypes don't match renderer registry ({}:{}).",
+                    carg + 1, closure_name, sym.typespec(), sym.unmangled(),
+                    p.type, op.sourcefile(), op.sourceline());
+            }
+        }
+        llvm_gen_keyword_fill(rop, op, clentry, closure_name, nullptr,
+                              2 + weighted + clentry->nformal, handle);
+        rop.llvm_store_value(handle, Result, 0, NULL, 0);
+        return true;
+    }
 
     // Call osl_allocate_closure_component(closure, id, size).  It returns
     // the memory for the closure parameter data.
@@ -3977,8 +4063,8 @@ LLVMGEN(llvm_gen_pointcloud_search)
                 else
                     clear_derivs_of.push_back(&Value);
             }
-        } else if (!rop.use_optix()) {
-            //TODO: Implement custom attribute arguments for OptiX
+        } else if (!rop.use_gpu()) {
+            //TODO: Implement custom attribute arguments for GPUs
 
             // It is a regular attribute, push it to the arg list
             llvm::Value* write_args[]
